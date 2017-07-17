@@ -17,6 +17,7 @@
 
 import datetime
 
+import ddt
 import mock
 from oslo_config import cfg
 from oslo_config import fixture as config_fixture
@@ -960,6 +961,30 @@ class DbQuotaDriverBaseTestCase(test.TestCase):
             return dict(project_id=project_id)
 
         self.mock_object(db, 'quota_allocated_get_all_by_project', fake_qagabp)
+
+    def _mock_get_by_project(self):
+        def fake_qgabp(context, project_id):
+            self.calls.append('quota_get_all_by_project')
+            self.assertEqual('test_project', project_id)
+            return dict(volumes=10, gigabytes=50, reserved=0,
+                        snapshots=10, backups=10,
+                        backup_gigabytes=50)
+
+        def fake_qugabp(context, project_id):
+            self.calls.append('quota_usage_get_all_by_project')
+            self.assertEqual('test_project', project_id)
+            return dict(volumes=dict(in_use=2, reserved=0),
+                        snapshots=dict(in_use=2, reserved=0),
+                        gigabytes=dict(in_use=10, reserved=0),
+                        backups=dict(in_use=2, reserved=0),
+                        backup_gigabytes=dict(in_use=10, reserved=0)
+                        )
+
+        self.mock_object(db, 'quota_get_all_by_project', fake_qgabp)
+        self.mock_object(db, 'quota_usage_get_all_by_project', fake_qugabp)
+
+        self._mock_quota_class_get_all_by_name()
+        self._mock_quota_class_get_default()
 
 
 class DbQuotaDriverTestCase(DbQuotaDriverBaseTestCase):
@@ -2210,3 +2235,140 @@ class QuotaVolumeTypeReservationTestCase(test.TestCase):
         mock_reserve.assert_called_once_with(my_context,
                                              project_id='vol_project_id',
                                              **reserve_opts)
+
+
+@ddt.ddt
+class OverbookingQuotaDriverTest(DbQuotaDriverBaseTestCase):
+    def setUp(self):
+        super(OverbookingQuotaDriverTest, self).setUp()
+        self.context = context.RequestContext('user_id',
+                                              'project_id',
+                                              is_admin=False,
+                                              auth_token='fake_token')
+        self.driver = quota.OverbookingDbQuotaDriver()
+        self.calls = []
+
+        def _fake_get_quota_usages_aggregate(*args, **kwargs):
+            self.calls.append('_get_quota_usages_aggregate')
+            return self.domain_usage
+
+        def _fake_quota_get_all_by_project(context, project_id):
+            self.calls.append('quota_get_all_by_project')
+            return self.domain_quota
+
+        self.stubs.Set(sqa_api, '_get_quota_usages_aggregate',
+                       _fake_get_quota_usages_aggregate)
+        self.stubs.Set(sqa_api, 'quota_get_all_by_project',
+                       _fake_quota_get_all_by_project)
+
+    @mock.patch('cinder.db.quota_domain_usage_check')
+    @mock.patch('cinder.quota_utils.get_project_neighbours')
+    def test_reserve(self, proj_neighbours_mock, db_mock):
+        class FakeProject(object):
+            def __init__(self, project_id):
+                self.id = project_id
+                self.domain_id = 'default'
+
+        self._mock_get_by_project()
+
+        neighbours = [FakeProject('foo%s' % i) for i in range(10)]
+        neighbours_ids = [i.id for i in neighbours]
+        proj_neighbours_mock.return_value = ('default', neighbours)
+
+        deltas = {'volumes': 1, 'gigabytes': 1}
+        self.driver.reserve(self.context,
+                            quota.QUOTAS.resources,
+                            deltas,
+                            project_id='test_project')
+
+        db_mock.assert_called_once_with(mock.ANY,
+                                        deltas,
+                                        'default',
+                                        neighbours_ids)
+
+    @mock.patch('cinder.db.quota_domain_usage_check')
+    @mock.patch('cinder.quota_utils.get_project_neighbours')
+    def test_reserve_overlimit(self, proj_neighbours_mock, db_mock):
+        class FakeProject(object):
+            def __init__(self, project_id):
+                self.id = project_id
+                self.domain_id = 'default'
+
+        self._mock_get_by_project()
+
+        neighbours = [FakeProject('foo%s' % i) for i in range(10)]
+        proj_neighbours_mock.return_value = ('default', neighbours)
+        db_mock.side_effect = exception.OverQuota(overs='volumes')
+
+        deltas = {'volumes': 1, 'gigabytes': 1}
+        raised_exc = self.assertRaises(exception.OverQuota,
+                                       self.driver.reserve,
+                                       self.context,
+                                       quota.QUOTAS.resources,
+                                       deltas,
+                                       project_id='test_project')
+        self.assertTrue('volumes' in str(raised_exc))
+
+    def test_quota_domain_usage_check(self):
+        domain_id = 'fake_domain'
+        self.domain_quota = {'volumes': 5, 'gigabytes': 10}
+        self.domain_usage = {'volumes': {'in_use': 3, 'reserved': 1},
+                             'gigabytes': {'in_use': 4, 'reserved': 2}}
+
+        projects_ids = ["test_project_%.2d" % i for i in range(10)]
+
+        sqa_api.quota_domain_usage_check(context.get_admin_context(),
+                                         {'volumes': 1},
+                                         domain_id,
+                                         projects_ids)
+        self.assertEqual(['quota_get_all_by_project',
+                          '_get_quota_usages_aggregate'], self.calls)
+
+    def test_quota_domain_usage_check_volume_overlimit(self):
+        domain_id = 'fake_domain'
+        self.domain_quota = {'volumes': 4, 'gigabytes': 10}
+        self.domain_usage = {'volumes': {'in_use': 3, 'reserved': 1},
+                             'gigabytes': {'in_use': 4, 'reserved': 2}}
+
+        projects_ids = ["test_project_%.2d" % i for i in range(10)]
+
+        self.assertRaises(exception.OverQuota,
+                          sqa_api.quota_domain_usage_check,
+                          context.get_admin_context(),
+                          {'volumes': 1},
+                          domain_id,
+                          projects_ids)
+
+    def test_quota_domain_usage_check_gigabytes_overlimit(self):
+        domain_id = 'fake_domain'
+        self.domain_quota = {'volumes': 10, 'gigabytes': 10}
+        self.domain_usage = {'volumes': {'in_use': 3, 'reserved': 1},
+                             'gigabytes': {'in_use': 4, 'reserved': 2}}
+
+        projects_ids = ["test_project_%.2d" % i for i in range(10)]
+
+        self.assertRaises(exception.OverQuota,
+                          sqa_api.quota_domain_usage_check,
+                          context.get_admin_context(),
+                          {'volumes': 1, 'gigabytes': 8},
+                          domain_id,
+                          projects_ids)
+
+    @ddt.data(None, 'default')
+    @mock.patch('cinder.quota_utils.get_domain')
+    def test_upper_limits(self, db_project_mock_return_value, db_project_mock):
+        db_project_mock.return_value = db_project_mock_return_value
+        if db_project_mock_return_value:
+            self.domain_quota = {'volumes': 10, 'gigabytes': 10}
+        else:
+            self.domain_quota = {}
+
+        actual_quota = self.driver.get_upper_limits(
+            self.context, project_id='test_project')
+
+        self.assertEqual(self.domain_quota, actual_quota)
+        db_project_mock.assert_called_once_with(self.context, 'test_project')
+        if db_project_mock_return_value:
+            self.assertIn('quota_get_all_by_project', self.calls)
+        else:
+            self.assertNotIn('quota_get_all_by_project', self.calls)

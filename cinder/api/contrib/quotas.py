@@ -268,15 +268,19 @@ class QuotaSetsController(wsgi.Controller):
                                                              target_project_id,
                                                              defaults=False)
         quota_values.update(group_quota_values)
+        upper_limits = QUOTAS.get_upper_limits(context, target_project_id)
         valid_quotas = {}
         reservations = []
         for key in body['quota_set'].keys():
             if key in NON_QUOTA_KEYS:
                 continue
 
+            max_value = upper_limits.get(key)
+            if max_value is None or max_value == -1:
+                max_value = db.MAX_INT
             value = utils.validate_integer(
                 body['quota_set'][key], key, min_value=-1,
-                max_value=db.MAX_INT)
+                max_value=max_value)
 
             # Can't skip the validation of nested quotas since it could mess up
             # hierarchy if parent limit is less than childrens' current usage

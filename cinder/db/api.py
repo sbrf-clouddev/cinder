@@ -1121,6 +1121,11 @@ def quota_usage_get_all_by_project(context, project_id):
 ###################
 
 
+def quota_domain_usage_check(context, deltas, domain_id, neighbours_ids):
+    return IMPL.quota_domain_usage_check(context, deltas, domain_id,
+                                         neighbours_ids)
+
+
 def quota_reserve(context, resources, quotas, deltas, expire,
                   until_refresh, max_age, project_id=None,
                   is_allocated_reserve=False):

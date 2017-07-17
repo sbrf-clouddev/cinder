@@ -14,6 +14,7 @@
 #    under the License.
 
 import mock
+import webob
 
 from cinder import context
 from cinder import exception
@@ -30,20 +31,25 @@ CONF = cfg.CONF
 
 class QuotaUtilsTest(test.TestCase):
     class FakeProject(object):
-        def __init__(self, id='foo', parent_id=None):
+        def __init__(self, id='foo', parent_id=None, domain_id=None):
             self.id = id
             self.parent_id = parent_id
             self.subtree = None
             self.parents = None
-            self.domain_id = 'default'
+            self.domain_id = domain_id if domain_id else 'default'
 
     def setUp(self):
         super(QuotaUtilsTest, self).setUp()
 
         self.auth_url = 'http://localhost:5000'
+        authtoken_conf = {i: 'admin' for i in ('admin_user',
+                                               'admin_password',
+                                               'admin_tenant_name')}
+        [setattr(self, k, v) for k, v in authtoken_conf.items()]
+        authtoken_conf['auth_uri'] = self.auth_url
         self.context = context.RequestContext('fake_user', 'fake_proj_id')
         self.fixture = self.useFixture(config_fixture.Config(CONF))
-        self.fixture.config(auth_uri=self.auth_url, group='keystone_authtoken')
+        self.fixture.config(group='keystone_authtoken', **authtoken_conf)
 
     @mock.patch('keystoneclient.client.Client')
     @mock.patch('keystoneauth1.session.Session')
@@ -53,6 +59,25 @@ class QuotaUtilsTest(test.TestCase):
         ksclient_class.assert_called_once_with(auth_url=self.auth_url,
                                                session=ksclient_session(),
                                                version=(3, 0))
+
+    @mock.patch('keystoneclient.auth.identity.generic.password.Password')
+    @mock.patch('keystoneclient.client.Client')
+    @mock.patch('keystoneauth1.loading.session.Session')
+    def test_keystone_client_instantiation_admin(self, ksal_session,
+                                                 ksclient_class,
+                                                 ksclient_password):
+        quota_utils._keystone_client(
+            self.context, version=(3, 0), require_admin=True)
+
+        ksclient_password.assert_called_once_with(
+            auth_url=self.auth_url,
+            username=self.admin_user,
+            password=self.admin_password,
+            project_name=self.admin_tenant_name)
+        ksclient_class.assert_called_once_with(
+            auth_url=self.auth_url,
+            session=ksal_session.return_value.load_from_options.return_value,
+            version=(3, 0))
 
     @mock.patch('keystoneclient.client.Client')
     def test_get_project_keystoneclient_v2(self, ksclient_class):
@@ -92,6 +117,46 @@ class QuotaUtilsTest(test.TestCase):
         keystoneclient.projects.get.assert_called_once_with(
             self.context.project_id, parents_as_ids=False, subtree_as_ids=True)
         self.assertEqual(expected_project.__dict__, project.__dict__)
+
+    @mock.patch('keystoneclient.client.Client')
+    def test_get_project_neighbours(self, ksclient_class):
+        proj_count = 5
+        fake_domain_id = 'foo_domain'
+
+        keystoneclient = ksclient_class.return_value
+        keystoneclient.version = 'v3'
+        returned_project = self.FakeProject(self.context.project_id,
+                                            parent_id=None,
+                                            domain_id=fake_domain_id)
+        neighbours = [self.FakeProject('foo%s' % i,
+                                       parent_id=None,
+                                       domain_id=fake_domain_id)
+                      for i in range(proj_count)]
+
+        keystoneclient.projects.get.return_value = returned_project
+        keystoneclient.projects.list.return_value = neighbours
+
+        dom_id, proj_neighbours = quota_utils.get_project_neighbours(
+            self.context,
+            self.context.project_id)
+
+        self.assertEqual(dom_id, fake_domain_id)
+        self.assertEqual(len(proj_neighbours), proj_count)
+        keystoneclient.projects.get.assert_called_once_with(
+            self.context.project_id)
+        keystoneclient.projects.list.assert_called_once_with(
+            domain=fake_domain_id)
+
+    @mock.patch('keystoneclient.client.Client')
+    def test_get_project_neighbours_nonexist_proj(self, ksclient_class):
+        keystoneclient = ksclient_class.return_value
+        keystoneclient.version = 'v3'
+
+        keystoneclient.projects.get.side_effect = exceptions.NotFound
+
+        self.assertRaises(webob.exc.HTTPNotFound,
+                          quota_utils.get_project_neighbours,
+                          self.context, self.context.project_id)
 
     def _setup_mock_ksclient(self, mock_client, version='v3',
                              subtree=None, parents=None):

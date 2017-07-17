@@ -1081,3 +1081,38 @@ class QuotaSetsControllerNestedQuotasTest(QuotaSetsControllerTestBase):
         quota_limit['volumes'] = 5
         self.controller.update(self.req, self.B.id, body)
         self._assert_quota_show(self.A.id, res, allocated=6, in_use=1, limit=7)
+
+
+class OverbookingQuotaSetsControllerTest(QuotaSetsControllerTestBase):
+    def setUp(self):
+        super(OverbookingQuotaSetsControllerTest, self).setUp()
+        driver = quota.OverbookingDbQuotaDriver()
+        patcher = mock.patch('cinder.quota.VolumeTypeQuotaEngine._driver',
+                             driver)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_update_with_upper_limits_passed(self):
+        upper_limit_mock = mock.MagicMock(return_value={
+            "gigabytes": 2000, "snapshots": 15, "volumes": 5
+        })
+        quota.QUOTAS._driver.get_upper_limits = upper_limit_mock
+        body = make_body(gigabytes=2000, snapshots=15,
+                         volumes=5, backups=5, tenant_id=None)
+
+        result = self.controller.update(self.req, 'foo', body)
+        self.assertDictEqual(body, result)
+        upper_limit_mock.assert_called_once_with(
+            self.req.environ['cinder.context'], 'foo')
+
+    def test_update_with_too_big_limits(self):
+        upper_limit_mock = mock.MagicMock(return_value={
+            "gigabytes": 2000, "snapshots": 15, "volumes": 5
+        })
+        quota.QUOTAS._driver.get_upper_limits = upper_limit_mock
+        body = make_body(gigabytes=3000, snapshots=15,
+                         volumes=5, backups=5, tenant_id=None)
+        self.assertRaises(webob.exc.HTTPBadRequest, self.controller.update,
+                          self.req, 'foo', body)
+        upper_limit_mock.assert_called_once_with(
+            self.req.environ['cinder.context'], 'foo')

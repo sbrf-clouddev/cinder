@@ -12,11 +12,14 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+
 from oslo_config import cfg
 from oslo_log import log as logging
+import webob
 
 from keystoneauth1 import identity
 from keystoneauth1 import loading as ka_loading
+from keystoneclient.auth.identity.generic import password
 from keystoneclient import client
 from keystoneclient import exceptions
 
@@ -123,6 +126,34 @@ def get_project_hierarchy(context, project_id, subtree_as_ids=False,
     return generic_project
 
 
+def get_project_neighbours(context, project_id):
+    """Get projects within its domain
+
+    Get project's domain and return all projects
+    within this domain.
+    """
+
+    try:
+        keystone = _keystone_client(context, (3, 0), True)
+        project = keystone.projects.get(project_id)
+
+        domain_id = project.domain_id
+        neighbours = keystone.projects.list(domain=domain_id)
+
+        return domain_id, neighbours
+    except exceptions.NotFound:
+        msg = (_("Tenant ID: %s does not exist.") % project_id)
+        raise webob.exc.HTTPNotFound(explanation=msg)
+
+
+def get_domain(context, project_id):
+    ksc = _keystone_client(context, (3, 0))
+    try:
+        return ksc.projects.get(project_id).domain_id
+    except exceptions.NotFound:
+        pass
+
+
 def get_parent_project_id(context, project_id):
     return get_project_hierarchy(context, project_id).parent_id
 
@@ -219,17 +250,25 @@ def validate_setup_for_nested_quota_use(ctxt, resources,
         raise exception.CinderException(message=msg)
 
 
-def _keystone_client(context, version=(3, 0)):
+def _keystone_client(context, version=(3, 0), require_admin=False):
     """Creates and returns an instance of a generic keystone client.
 
     :param context: The request context
     :param version: version of Keystone to request
+    :param require_admin: if admin user is required
     :return: keystoneclient.client.Client object
     """
-    auth_plugin = identity.Token(
-        auth_url=CONF.keystone_authtoken.auth_uri,
-        token=context.auth_token,
-        project_id=context.project_id)
+    if require_admin and not context.is_admin:
+        auth_plugin = password.Password(
+            auth_url=CONF.keystone_authtoken.auth_uri,
+            username=CONF.keystone_authtoken.admin_user,
+            password=CONF.keystone_authtoken.admin_password,
+            project_name=CONF.keystone_authtoken.admin_tenant_name)
+    else:
+        auth_plugin = identity.Token(
+            auth_url=CONF.keystone_authtoken.auth_uri,
+            token=context.auth_token,
+            project_id=context.project_id)
 
     client_session = ka_loading.session.Session().load_from_options(
         auth=auth_plugin,

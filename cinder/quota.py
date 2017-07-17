@@ -450,6 +450,40 @@ class DbQuotaDriver(object):
 
         db.reservation_expire(context)
 
+    def get_upper_limits(self, context, project_id):
+        return {}
+
+
+class OverbookingDbQuotaDriver(DbQuotaDriver):
+
+    def _reserve(self, ctxt, resources, quotas, deltas, expire, project_id):
+        domain_id, neighbours = quota_utils.get_project_neighbours(ctxt,
+                                                                   project_id)
+        neighbours_ids = [n.id for n in neighbours]
+        db.quota_domain_usage_check(context.get_admin_context(),
+                                    deltas,
+                                    domain_id,
+                                    neighbours_ids)
+
+        return super(OverbookingDbQuotaDriver, self)._reserve(ctxt,
+                                                              resources,
+                                                              quotas,
+                                                              deltas,
+                                                              expire,
+                                                              project_id)
+
+    def get_upper_limits(self, ctx, project_id):
+        # step try to request domain id
+        # remember we use the same function for domain quotas, so
+        # it will produce not found for domains
+        domain_id = quota_utils.get_domain(ctx, project_id)
+        if domain_id:
+            # ok, we have got a domain and can request upper limit from
+            # domain quotas
+            return db.quota_get_all_by_project(context.get_admin_context(),
+                                               domain_id)
+        return {}
+
 
 class NestedDbQuotaDriver(DbQuotaDriver):
     def validate_nested_setup(self, ctxt, resources, project_tree,
@@ -1122,6 +1156,9 @@ class QuotaEngine(object):
     @property
     def resources(self):
         return self._resources
+
+    def get_upper_limits(self, context, project_id):
+        return self._driver.get_upper_limits(context, project_id)
 
 
 class VolumeTypeQuotaEngine(QuotaEngine):

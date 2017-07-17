@@ -1125,6 +1125,49 @@ def quota_usage_update_resource(context, old_res, new_res):
             usage.until_refresh = 1
 
 
+def _get_quota_usages_aggregate(context, session, project_ids):
+    rows = model_query(context,
+                       models.QuotaUsage.resource,
+                       func.sum(models.QuotaUsage.in_use).label('in_use'),
+                       func.sum(models.QuotaUsage.reserved).label('reserved'),
+                       read_deleted="no",
+                       session=session).\
+        filter(models.QuotaUsage.project_id.in_(project_ids)).\
+        group_by(models.QuotaUsage.resource).\
+        with_lockmode('update').\
+        all()
+    return {row.resource: {'in_use': row.in_use,
+                           'reserved': row.reserved} for row in rows}
+
+
+@require_context
+@_retry_on_deadlock
+def quota_domain_usage_check(context, deltas, domain_id, neighbours_ids):
+    domain_quota = quota_get_all_by_project(context, domain_id)
+
+    session = get_session()
+    domain_usages = _get_quota_usages_aggregate(context,
+                                                session,
+                                                neighbours_ids)
+
+    for resource, value in deltas.items():
+        if resource not in domain_quota:
+            continue
+
+        domain_resource_limit = domain_quota[resource]
+
+        if resource not in domain_usages:
+            continue
+
+        domain_resource_usage = (domain_usages[resource]['in_use'] +
+                                 domain_usages[resource]['reserved'])
+
+        if domain_resource_usage + value > domain_resource_limit:
+            raise exception.OverQuota(overs=sorted([resource]),
+                                      quotas=domain_quota,
+                                      usages=domain_usages)
+
+
 @require_context
 @_retry_on_deadlock
 def quota_reserve(context, resources, quotas, deltas, expire,
